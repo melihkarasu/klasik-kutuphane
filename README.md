@@ -9,7 +9,7 @@ Project Gutenberg ile 70.000+ dünya klasiği, tarayıcı içi e-kitap okuyucu, 
 
 ## 🚀 Hızlı Başlangıç
 1. Bu repoyu klonlayın.
-2.  dosyasını tarayıcıda açın.
+2. `index.html` dosyasını tarayıcıda açın.
 
 
 
