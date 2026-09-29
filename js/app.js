@@ -189,6 +189,183 @@ function filterBooks(cat) {
 }
 
 // 2. Tam Metin Okuyucuyu Başlat (Reader Modal)
+// ===== Istemci Tarafi Arama & Metin Servisi =====
+// Standalone surumde backend yok: arama OpenLibrary uzerinden, kitap metni
+// r.jina.ai reader proxy'si uzerinden cekilir (ikisi de CORS-acik; 2026-09-29 dogrulandi).
+// API sozlesmesi monorepo /api/kutuphane/* ile birebir ayni tutuldu.
+
+function normalizeTrSearch(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/ğ/g, 'g')
+    .replace(/ü/g, 'u')
+    .replace(/ş/g, 's')
+    .replace(/ı/g, 'i')
+    .replace(/ö/g, 'o')
+    .replace(/ç/g, 'c')
+    .replace(/dostoyevski/g, 'dostoyevsky')
+    .replace(/sefiller/g, 'les miserables')
+    .replace(/donusum/g, 'metamorphosis');
+}
+
+// CLASSIC_BOOKS'i monorepo arama katalog bicimine cevir (trTitle -> trTitle eslesmesi icin)
+function classicCatalogForSearch() {
+  return CLASSIC_BOOKS.map(b => ({
+    id: b.id,
+    title: b.title,
+    trTitle: b.titleTr || b.title,
+    author: b.author,
+    year: b.year,
+    category: b.category || 'roman',
+    cover: b.cover
+  }));
+}
+
+async function clientSearchBooks(query) {
+  const qLower = query.toLowerCase();
+  const qNorm = normalizeTrSearch(query);
+
+  // 1. Adim: yerel klasik katalogunda eslesme (Turkce/Ingilizce normalizasyon)
+  const catalog = classicCatalogForSearch();
+  const localMatches = catalog.filter(b => {
+    const bTitleNorm = normalizeTrSearch(b.title);
+    const bTrNorm = normalizeTrSearch(b.trTitle || '');
+    const bAuthorNorm = normalizeTrSearch(b.author);
+    const bCatNorm = normalizeTrSearch(b.category || '');
+
+    return bTitleNorm.includes(qNorm) ||
+           bTrNorm.includes(qNorm) ||
+           bAuthorNorm.includes(qNorm) ||
+           bCatNorm.includes(qNorm) ||
+           b.title.toLowerCase().includes(qLower) ||
+           b.author.toLowerCase().includes(qLower);
+  });
+
+  // 2. Adim: OpenLibrary canli arama (CORS-acik)
+  let externalMatches = [];
+  try {
+    const olUrl = 'https://openlibrary.org/search.json?q=' + encodeURIComponent(query) + '&limit=12';
+    const olRes = await fetch(olUrl, { signal: AbortSignal.timeout(8000) });
+    if (olRes.ok) {
+      const olData = await olRes.json();
+      (olData.docs || []).forEach(doc => {
+        const title = doc.title || 'İsimsiz Eser';
+        const author = (doc.author_name && doc.author_name[0]) ? doc.author_name[0] : 'Bilinmeyen Yazar';
+
+        let gutenbergId = null;
+        if (doc.id_project_gutenberg && doc.id_project_gutenberg.length > 0) {
+          gutenbergId = parseInt(doc.id_project_gutenberg[0], 10);
+        }
+
+        let coverUrl = 'https://images.unsplash.com/photo-1544716278-ca5e3f4abd8c?w=400&auto=format&fit=crop&q=80';
+        if (doc.cover_i) {
+          coverUrl = 'https://covers.openlibrary.org/b/id/' + doc.cover_i + '-M.jpg';
+        } else if (gutenbergId) {
+          coverUrl = 'https://www.gutenberg.org/cache/epub/' + gutenbergId + '/pg' + gutenbergId + '.cover.medium.jpg';
+        }
+
+        externalMatches.push({
+          id: gutenbergId || (doc.key ? doc.key.replace('/works/', '') : null),
+          gutenbergId: gutenbergId,
+          title: title,
+          trTitle: '',
+          author: author,
+          year: doc.first_publish_year || (doc.publish_year && doc.publish_year[0]) || 'Klasik',
+          cover: coverUrl,
+          hasFullText: !!gutenbergId,
+          isExternal: true
+        });
+      });
+    }
+  } catch(olErr) {
+    // Harici arama basarisizsa yerel katalog sonuclari yeterli
+  }
+
+  // Birlestir ve tekillestir (yerel eslesmeler oncelikli)
+  const combined = localMatches.slice();
+  const seenTitles = new Set(localMatches.map(m => m.title.toLowerCase()));
+  externalMatches.forEach(item => {
+    const tLower = item.title.toLowerCase();
+    if (!seenTitles.has(tLower)) {
+      seenTitles.add(tLower);
+      combined.push(item);
+    }
+  });
+
+  return {
+    success: true,
+    query: query,
+    total: combined.length,
+    books: combined.slice(0, 24)
+  };
+}
+
+async function clientFetchBookText(bookId) {
+  // Gutenberg dogrudan CORS vermiyor; r.jina.ai reader proxy'si (CORS-acik) kullanilir
+  const target = 'https://www.gutenberg.org/cache/epub/' + bookId + '/pg' + bookId + '.txt';
+  const res = await fetch('https://r.jina.ai/' + target, { signal: AbortSignal.timeout(25000) });
+  if (!res.ok) {
+    throw new Error('Metin servisi HTTP ' + res.status + ' dondu');
+  }
+
+  let fullText = await res.text();
+
+  // Jina markdown sarmalayicisini soy ("Title: ... / URL Source: ... / Markdown Content:")
+  const mdIdx = fullText.indexOf('Markdown Content:');
+  if (mdIdx !== -1) {
+    fullText = fullText.substring(mdIdx + 'Markdown Content:'.length);
+  }
+  fullText = fullText.replace(/\r\n/g, '\n');
+
+  // Gutenberg START/END lisans isaretlerini temizle (monorepo API'siyle ayni mantik)
+  let cleanText = fullText;
+  const startMarkers = [
+    '*** START OF THE PROJECT GUTENBERG',
+    '*** START OF THIS PROJECT GUTENBERG',
+    '*END*THE SMALL PRINT'
+  ];
+  for (const marker of startMarkers) {
+    const idx = cleanText.indexOf(marker);
+    if (idx !== -1) {
+      const nextLine = cleanText.indexOf('\n', idx);
+      if (nextLine !== -1) cleanText = cleanText.substring(nextLine + 1);
+      break;
+    }
+  }
+  const endMarkers = [
+    '*** END OF THE PROJECT GUTENBERG',
+    '*** END OF THIS PROJECT GUTENBERG',
+    'End of the Project Gutenberg'
+  ];
+  for (const marker of endMarkers) {
+    const idx = cleanText.indexOf(marker);
+    if (idx !== -1) {
+      cleanText = cleanText.substring(0, idx);
+      break;
+    }
+  }
+  cleanText = cleanText.trim();
+
+  // Baslik/yazar bilgisini metin basligindan cek
+  let metaTitle = null;
+  let metaAuthor = null;
+  const titleMatch = fullText.slice(0, 3000).match(/Title:\s*([^\r\n]+)/i);
+  if (titleMatch) metaTitle = titleMatch[1].trim();
+  const authorMatch = fullText.slice(0, 3000).match(/Author:\s*([^\r\n]+)/i);
+  if (authorMatch) metaAuthor = authorMatch[1].trim();
+
+  const wordCount = cleanText.split(/\s+/).filter(Boolean).length;
+
+  return {
+    success: true,
+    id: bookId,
+    title: metaTitle,
+    author: metaAuthor,
+    wordCount: wordCount,
+    content: cleanText
+  };
+}
+
 async function openBookReader(bookId, optTitle = null, optAuthor = null, optCover = null, optTrTitle = null) {
   if (window.showToast) window.showToast('📖 Kitap metni Project Gutenberg arşivinden yükleniyor...');
 
@@ -215,8 +392,7 @@ async function openBookReader(bookId, optTitle = null, optAuthor = null, optCove
   document.getElementById('reader-modal').classList.remove('hidden');
 
   try {
-    const res = await fetch(`/api/kutuphane/read?id=${bookId}`);
-    const data = await res.json();
+    const data = await clientFetchBookText(bookId);
 
     if (!data.success || !data.content) {
       throw new Error('Metin alınamadı');
@@ -632,8 +808,7 @@ async function searchBooks(customQuery = null) {
   header.innerHTML = '<span>📚</span> "' + query + '" İçin Arama Sonuçları';
 
   try {
-    const res = await fetch(`/api/kutuphane/search?q=${encodeURIComponent(query)}`);
-    const data = await res.json();
+    const data = await clientSearchBooks(query);
 
     if (!data.success || !data.books || data.books.length === 0) {
       grid.innerHTML = '<div class="col-span-full py-10 text-center text-xs text-mistral-stone bg-mistral-cream-light rounded-2xl border border-mistral-beige-deep p-6">"' + query + '" ile eşleşen bir eser bulunamadı. Lütfen yazarın veya eserin farklı bir yazımını deneyin (Örn: Dostoyevski, Tolstoy, Kafka, Frankenstein).</div>';
